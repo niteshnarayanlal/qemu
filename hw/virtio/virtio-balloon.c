@@ -33,6 +33,9 @@
 
 #define BALLOON_PAGE_SIZE  (1 << VIRTIO_BALLOON_PFN_SHIFT)
 
+void page_hinting_request(uint64_t addr, uint32_t len);
+static int hinting_req_cnt;
+
 static void balloon_page(void *addr, int deflate)
 {
     if (!qemu_balloon_is_inhibited()) {
@@ -75,7 +78,18 @@ static bool balloon_stats_supported(const VirtIOBalloon *s)
     return virtio_vdev_has_feature(vdev, VIRTIO_BALLOON_F_STATS_VQ);
 }
 
+static bool balloon_hinting_supported(const VirtIOBalloon *s)
+{
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    return virtio_vdev_has_feature(vdev, VIRTIO_BALLOON_F_HINTING);
+}
+
 static bool balloon_stats_enabled(const VirtIOBalloon *s)
+{
+    return s->stats_poll_interval > 0;
+}
+
+static bool page_hinting_enabled(const VirtIOBalloon *s)
 {
     return s->stats_poll_interval > 0;
 }
@@ -95,14 +109,20 @@ static void balloon_stats_change_timer(VirtIOBalloon *s, int64_t secs)
     timer_mod(s->stats_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + secs * 1000);
 }
 
+static void page_hinting_change_timer(VirtIOBalloon *s, int64_t secs)
+{
+    timer_mod(s->stats_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + secs * 1000);
+}
+
 static void balloon_stats_poll_cb(void *opaque)
 {
     VirtIOBalloon *s = opaque;
     VirtIODevice *vdev = VIRTIO_DEVICE(s);
 
-    if (s->stats_vq_elem == NULL || !balloon_stats_supported(s)) {
+    if (s->stats_vq_elem == NULL || !balloon_stats_supported(s) || !balloon_hinting_supported(s)) {
         /* re-schedule */
         balloon_stats_change_timer(s, s->stats_poll_interval);
+        page_hinting_change_timer(s, s->stats_poll_interval);
         return;
     }
 
@@ -199,12 +219,104 @@ static void balloon_stats_set_poll_interval(Object *obj, Visitor *v,
         balloon_stats_change_timer(s, value);
         return;
     }
+    
+    if (page_hinting_enabled(s)) {
+        /* timer interval change */
+        s->stats_poll_interval = value;
+        page_hinting_change_timer(s, value);
+        return;
+    }
 
     /* create a new timer */
     g_assert(s->stats_timer == NULL);
     s->stats_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, balloon_stats_poll_cb, s);
     s->stats_poll_interval = value;
     balloon_stats_change_timer(s, 0);
+    /* create a new timer */
+    g_assert(s->stats_timer == NULL);
+    s->stats_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, balloon_stats_poll_cb, s);
+    s->stats_poll_interval = value;
+    page_hinting_change_timer(s, 0);
+}
+
+static void *gpa2hva(MemoryRegion **p_mr, hwaddr addr, Error **errp)
+{
+    MemoryRegionSection mrs = memory_region_find(get_system_memory(),
+                                                 addr, 1);
+
+    if (!mrs.mr) {
+        error_setg(errp, "No memory is mapped at address 0x%" HWADDR_PRIx, addr);
+        return NULL;
+    }
+
+    if (!memory_region_is_ram(mrs.mr) && !memory_region_is_romd(mrs.mr)) {
+        error_setg(errp, "Memory at address 0x%" HWADDR_PRIx "is not RAM", addr);
+        memory_region_unref(mrs.mr);
+        return NULL;
+    }
+
+    *p_mr = mrs.mr;
+    return qemu_map_ram_ptr(mrs.mr->ram_block, mrs.offset_within_region);
+}
+
+struct guest_pages {
+	unsigned long pfn;
+	unsigned int order;
+};
+
+
+void page_hinting_request(uint64_t addr, uint32_t len)
+{
+    Error *local_err = NULL;
+    MemoryRegion *mr = NULL;
+    void *hvaddr;
+    int ret = 0;
+    struct guest_pages *guest_obj;
+    int i = 0;
+    void *hvaddr_to_free;
+    unsigned long pfn, pfn_end;
+    uint64_t gpaddr_to_free;
+
+    hvaddr = gpa2hva(&mr, addr, &local_err);
+    if (local_err) {
+        error_report_err(local_err);
+        return;
+    }
+    guest_obj = hvaddr;
+
+    while (i < len) {
+        pfn = guest_obj[i].pfn;
+	pfn_end = guest_obj[i].pfn + (1 << guest_obj[i].order) - 1;
+	trace_virtio_balloon_hinting_request(pfn,(1 << guest_obj[i].order));
+	while (pfn <= pfn_end) {
+	        gpaddr_to_free = pfn << VIRTIO_BALLOON_PFN_SHIFT;
+	        hvaddr_to_free = gpa2hva(&mr, gpaddr_to_free, &local_err);
+    		hinting_req_cnt++;
+	        if (local_err) {
+			error_report_err(local_err);
+		        return;
+		}
+		ret = qemu_madvise((void *)hvaddr_to_free, 4096, QEMU_MADV_DONTNEED);
+		if (ret == -1)
+		    printf("\n%d:%s Error: Madvise failed with error:%d\n", __LINE__, __func__, ret);
+		pfn++;
+	}
+	trace_virtio_hinted_page_count(hinting_req_cnt);
+	i++;
+    }
+}
+
+
+static void virtio_balloon_page_hinting(VirtIODevice *vdev, VirtQueue *vq)
+{
+    uint64_t addr;
+    uint32_t len;
+    VirtQueueElement elem = {};
+
+    pop_hinting_addr(vq, &addr, &len);
+    page_hinting_request(addr, len);
+    virtqueue_push(vq, &elem, 0);
+    virtio_notify(vdev, vq);
 }
 
 static void virtio_balloon_handle_output(VirtIODevice *vdev, VirtQueue *vq)
@@ -376,6 +488,7 @@ static uint64_t virtio_balloon_get_features(VirtIODevice *vdev, uint64_t f,
     VirtIOBalloon *dev = VIRTIO_BALLOON(vdev);
     f |= dev->host_features;
     virtio_add_feature(&f, VIRTIO_BALLOON_F_STATS_VQ);
+    virtio_add_feature(&f, VIRTIO_BALLOON_F_HINTING);
     return f;
 }
 
@@ -408,6 +521,9 @@ static int virtio_balloon_post_load_device(void *opaque, int version_id)
 
     if (balloon_stats_enabled(s)) {
         balloon_stats_change_timer(s, s->stats_poll_interval);
+    }
+    if (page_hinting_enabled(s)) {
+        page_hinting_change_timer(s, s->stats_poll_interval);
     }
     return 0;
 }
@@ -445,6 +561,7 @@ static void virtio_balloon_device_realize(DeviceState *dev, Error **errp)
     s->ivq = virtio_add_queue(vdev, 128, virtio_balloon_handle_output);
     s->dvq = virtio_add_queue(vdev, 128, virtio_balloon_handle_output);
     s->svq = virtio_add_queue(vdev, 128, virtio_balloon_receive_stats);
+    s->hvq = virtio_add_queue(vdev, 128, virtio_balloon_page_hinting);
 
     reset_stats(s);
 }
@@ -488,6 +605,8 @@ static void virtio_balloon_instance_init(Object *obj)
 
     object_property_add(obj, "guest-stats", "guest statistics",
                         balloon_stats_get_all, NULL, NULL, s, NULL);
+    object_property_add(obj, "guest-page-hinting", "guest page hinting",
+                        NULL, NULL, NULL, s, NULL);
 
     object_property_add(obj, "guest-stats-polling-interval", "int",
                         balloon_stats_get_poll_interval,
