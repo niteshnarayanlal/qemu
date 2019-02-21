@@ -234,6 +234,11 @@ static void *gpa2hva(MemoryRegion **p_mr, hwaddr addr, Error **errp)
     return qemu_map_ram_ptr(mrs.mr->ram_block, mrs.offset_within_region);
 }
 
+struct guest_request {
+        uint64_t addr;
+        int entries;
+};
+
 void page_hinting_request(uint64_t addr, uint32_t len)
 {
     Error *local_err = NULL;
@@ -241,6 +246,7 @@ void page_hinting_request(uint64_t addr, uint32_t len)
     void *hvaddr;
     int ret = 0;
     struct guest_pages *guest_obj;
+    struct guest_request *guest_req;
     int i = 0;
     void *hvaddr_to_free;
     unsigned long pfn, pfn_end;
@@ -251,12 +257,21 @@ void page_hinting_request(uint64_t addr, uint32_t len)
         error_report_err(local_err);
         return;
     }
-    guest_obj = hvaddr;
+    guest_req = hvaddr;
 
-    while (i < len) {
+    printf("\nguest_request guest physical addr:%lu isolate_page array addr:%lu len:%d\n", addr, guest_req->addr, guest_req->entries);
+    void * temp_addr = gpa2hva(&mr, guest_req->addr, &local_err);
+    if (local_err) {
+        error_report_err(local_err);
+        return;
+    }
+    guest_obj = temp_addr; 
+    
+    while (i < guest_req->entries) {
         pfn = guest_obj[i].pfn;
 	pfn_end = guest_obj[i].pfn + (1 << guest_obj[i].order) - 1;
 	trace_virtio_balloon_hinting_request(pfn,(1 << guest_obj[i].order));
+	printf("\nentry:%d pfn:%lu order:%d\n", i, pfn, guest_obj[i].order);
 	while (pfn <= pfn_end) {
 	        gpaddr_to_free = pfn << VIRTIO_BALLOON_PFN_SHIFT;
 	        hvaddr_to_free = gpa2hva(&mr, gpaddr_to_free, &local_err);
