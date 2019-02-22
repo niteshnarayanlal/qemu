@@ -292,12 +292,18 @@ static void virtio_balloon_page_hinting(VirtIODevice *vdev, VirtQueue *vq)
 {
     uint64_t addr;
     uint32_t len;
-    VirtQueueElement elem = {};
+    VirtQueueElement *elem;
 
     pop_hinting_addr(vq, &addr, &len);
+    elem = virtqueue_pop(vq, sizeof(VirtQueueElement));
+        if (!elem) {
+        printf("\npop error\n");
+	    	return;
+        }
     page_hinting_request(addr, len);
-    virtqueue_push(vq, &elem, 0);
+    virtqueue_push(vq, elem, len);
     virtio_notify(vdev, vq);
+    g_free(elem);
 }
 
 static void virtio_balloon_handle_output(VirtIODevice *vdev, VirtQueue *vq)

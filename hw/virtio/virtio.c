@@ -1571,6 +1571,7 @@ void virtio_queue_notify(VirtIODevice *vdev, int n)
 {
     VirtQueue *vq = &vdev->vq[n];
 
+    printf("\n***Kick Recieved***\n");
     if (unlikely(!vq->vring.desc || vdev->broken)) {
         return;
     }
