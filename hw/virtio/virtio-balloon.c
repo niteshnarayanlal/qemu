@@ -243,31 +243,20 @@ void page_hinting_request(uint64_t addr, uint32_t len)
 {
     Error *local_err = NULL;
     MemoryRegion *mr = NULL;
-    void *hvaddr;
     int ret = 0;
     struct guest_pages *guest_obj;
-    struct guest_request *guest_req;
     int i = 0;
     void *hvaddr_to_free;
     unsigned long pfn, pfn_end;
     uint64_t gpaddr_to_free;
-
-    hvaddr = gpa2hva(&mr, addr, &local_err);
-    if (local_err) {
-        error_report_err(local_err);
-        return;
-    }
-    guest_req = hvaddr;
-
-    printf("\nguest_request guest physical addr:%lu isolate_page array addr:%lu len:%d\n", addr, guest_req->addr, guest_req->entries);
-    void * temp_addr = gpa2hva(&mr, guest_req->addr, &local_err);
+    printf("\nisolate_page array addr:%lu len:%d\n", addr,len);
+    void * temp_addr = gpa2hva(&mr, addr, &local_err);
     if (local_err) {
         error_report_err(local_err);
         return;
     }
     guest_obj = temp_addr; 
-    
-    while (i < guest_req->entries) {
+    while (i < len) {
         pfn = guest_obj[i].pfn;
 	pfn_end = guest_obj[i].pfn + (1 << guest_obj[i].order) - 1;
 	trace_virtio_balloon_hinting_request(pfn,(1 << guest_obj[i].order));
@@ -290,18 +279,24 @@ void page_hinting_request(uint64_t addr, uint32_t len)
 
 static void virtio_balloon_page_hinting(VirtIODevice *vdev, VirtQueue *vq)
 {
-    uint64_t addr;
-    uint32_t len;
-    VirtQueueElement *elem;
+    VirtQueueElement *elem = NULL;
+    uint64_t temp_addr;
+    uint32_t temp_len;
+    size_t size, t_size = 0;
 
-    pop_hinting_addr(vq, &addr, &len);
     elem = virtqueue_pop(vq, sizeof(VirtQueueElement));
-        if (!elem) {
-        printf("\npop error\n");
-	    	return;
-        }
-    page_hinting_request(addr, len);
-    virtqueue_push(vq, elem, len);
+    if (!elem) {
+	printf("\npop error\n");
+	return;
+    }
+    size = iov_to_buf(elem->out_sg, elem->out_num, 0, &temp_addr, sizeof(temp_addr));
+    printf("\naddr%lu size:%lu elem->out_num:%d\n", temp_addr, size, elem->out_num);
+    t_size += size;
+    size = iov_to_buf(elem->out_sg, elem->out_num, 8, &temp_len, sizeof(temp_len));
+    printf("\naddr%u size:%lu elem->out_num:%d\n", temp_len, size, elem->out_num);
+    t_size += size;
+    page_hinting_request(temp_addr, temp_len);
+    virtqueue_push(vq, elem, t_size);
     virtio_notify(vdev, vq);
     g_free(elem);
 }
