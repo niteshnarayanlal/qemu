@@ -35,7 +35,7 @@
 
 struct guest_pages {
 	unsigned long pfn;
-	unsigned int order;
+	unsigned long len;
 };
 
 void page_hinting_request(uint64_t addr, uint32_t len);
@@ -242,7 +242,7 @@ void page_hinting_request(uint64_t addr, uint32_t len)
     struct guest_pages *guest_obj;
     int i = 0;
     void *hvaddr_to_free;
-    unsigned long pfn, pfn_end;
+    unsigned long pfn;
     uint64_t gpaddr_to_free;
     void * temp_addr = gpa2hva(&mr, addr, &local_err);
 
@@ -253,20 +253,17 @@ void page_hinting_request(uint64_t addr, uint32_t len)
     guest_obj = temp_addr;
     while (i < len) {
         pfn = guest_obj[i].pfn;
-	pfn_end = guest_obj[i].pfn + (1 << guest_obj[i].order) - 1;
-	trace_virtio_balloon_hinting_request(pfn,(1 << guest_obj[i].order));
-	while (pfn <= pfn_end) {
-	        gpaddr_to_free = pfn << VIRTIO_BALLOON_PFN_SHIFT;
-	        hvaddr_to_free = gpa2hva(&mr, gpaddr_to_free, &local_err);
-	        if (local_err) {
-			error_report_err(local_err);
-		        return;
-		}
-		ret = qemu_madvise((void *)hvaddr_to_free, 4096, QEMU_MADV_DONTNEED);
-		if (ret == -1)
-		    printf("\n%d:%s Error: Madvise failed with error:%d\n", __LINE__, __func__, ret);
-		pfn++;
+	trace_virtio_balloon_hinting_request(pfn,guest_obj[i].len);
+	        
+	gpaddr_to_free = pfn << VIRTIO_BALLOON_PFN_SHIFT;
+	hvaddr_to_free = gpa2hva(&mr, gpaddr_to_free, &local_err);
+	if (local_err) {
+		error_report_err(local_err);
+		return;
 	}
+	ret = qemu_madvise((void *)hvaddr_to_free, guest_obj[i].len * 1024, QEMU_MADV_DONTNEED);
+	if (ret == -1)
+	    printf("\n%d:%s Error: Madvise failed with error:%d\n", __LINE__, __func__, ret);
 	i++;
     }
 }
