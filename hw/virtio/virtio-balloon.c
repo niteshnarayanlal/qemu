@@ -261,7 +261,8 @@ void page_hinting_request(uint64_t addr, uint32_t len)
 		error_report_err(local_err);
 		return;
 	}
-	ret = qemu_madvise((void *)hvaddr_to_free, guest_obj[i].len * 1024, QEMU_MADV_DONTNEED);
+//	ret = qemu_madvise((void *)hvaddr_to_free, guest_obj[i].len * 1024, QEMU_MADV_DONTNEED);
+	ret = qemu_madvise((void *)hvaddr_to_free, guest_obj[i].len * 1024, QEMU_MADV_FREE);
 	if (ret == -1)
 	    printf("\n%d:%s Error: Madvise failed with error:%d\n", __LINE__, __func__, ret);
 	i++;
