@@ -285,7 +285,8 @@ static void virtio_balloon_page_hinting(VirtIODevice *vdev, VirtQueue *vq)
     t_size += size;
     size = iov_to_buf(elem->out_sg, elem->out_num, 8, &temp_len, sizeof(temp_len));
     t_size += size;
-    page_hinting_request(temp_addr, temp_len);
+    if (!qemu_balloon_is_inhibited())
+	    page_hinting_request(temp_addr, temp_len);
     virtqueue_push(vq, elem, t_size);
     virtio_notify(vdev, vq);
     g_free(elem);
