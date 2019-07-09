@@ -34,6 +34,9 @@
 
 #define BALLOON_PAGE_SIZE  (1 << VIRTIO_BALLOON_PFN_SHIFT)
 
+#define VIRTIO_BALLOON_PAGE_HINTING_MAX_PAGES	16
+void free_mem_range(uint64_t addr, uint64_t len);
+
 struct PartiallyBalloonedPage {
     RAMBlock *rb;
     ram_addr_t base;
@@ -326,6 +329,58 @@ static void balloon_stats_set_poll_interval(Object *obj, Visitor *v,
     s->stats_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, balloon_stats_poll_cb, s);
     s->stats_poll_interval = value;
     balloon_stats_change_timer(s, 0);
+}
+
+void free_mem_range(uint64_t addr, uint64_t len)
+{
+    int ret = 0;
+    void *hvaddr_to_free;
+    MemoryRegionSection mrs = memory_region_find(get_system_memory(),
+                                                 addr, 1);
+    if (!mrs.mr) {
+	warn_report("%s:No memory is mapped at address 0x%lu", __func__, addr);
+        return;
+    }
+
+    if (!memory_region_is_ram(mrs.mr) && !memory_region_is_romd(mrs.mr)) {
+	warn_report("%s:Memory at address 0x%s is not RAM:0x%lu", __func__,
+		    HWADDR_PRIx, addr);
+        memory_region_unref(mrs.mr);
+        return;
+    }
+
+    hvaddr_to_free = qemu_map_ram_ptr(mrs.mr->ram_block, mrs.offset_within_region);
+    trace_virtio_balloon_hinting_request(addr, len);
+    ret = qemu_madvise(hvaddr_to_free,len, QEMU_MADV_FREE);
+    if (ret == -1) {
+	warn_report("%s: Madvise failed with error:%d", __func__, ret);
+    }
+}
+
+static void virtio_balloon_handle_page_hinting(VirtIODevice *vdev,
+					       VirtQueue *vq)
+{
+    VirtQueueElement *elem;
+    size_t offset = 0;
+    uint64_t gpa, len;
+    elem = virtqueue_pop(vq, sizeof(VirtQueueElement));
+    if (!elem) {
+        return;
+    }
+    /* For pending hints which are < max_pages(16), 'gpa != 0' ensures that we
+     * only read the buffer which holds a valid PFN value.
+     * TODO: Find a better way to do this.
+     */
+    while (iov_to_buf(elem->out_sg, elem->out_num, offset, &gpa, 8) == 8 && gpa != 0) {
+	offset += 8;
+	offset += iov_to_buf(elem->out_sg, elem->out_num, offset, &len, 8);
+	if (!qemu_balloon_is_inhibited()) {
+	    free_mem_range(gpa, len);
+	}
+    }
+    virtqueue_push(vq, elem, offset);
+    virtio_notify(vdev, vq);
+    g_free(elem);
 }
 
 static void virtio_balloon_handle_output(VirtIODevice *vdev, VirtQueue *vq)
@@ -694,6 +749,7 @@ static uint64_t virtio_balloon_get_features(VirtIODevice *vdev, uint64_t f,
     VirtIOBalloon *dev = VIRTIO_BALLOON(vdev);
     f |= dev->host_features;
     virtio_add_feature(&f, VIRTIO_BALLOON_F_STATS_VQ);
+    virtio_add_feature(&f, VIRTIO_BALLOON_F_HINTING);
 
     return f;
 }
@@ -780,6 +836,7 @@ static void virtio_balloon_device_realize(DeviceState *dev, Error **errp)
     s->ivq = virtio_add_queue(vdev, 128, virtio_balloon_handle_output);
     s->dvq = virtio_add_queue(vdev, 128, virtio_balloon_handle_output);
     s->svq = virtio_add_queue(vdev, 128, virtio_balloon_receive_stats);
+    s->hvq = virtio_add_queue(vdev, 128, virtio_balloon_handle_page_hinting);
 
     if (virtio_has_feature(s->host_features,
                            VIRTIO_BALLOON_F_FREE_PAGE_HINT)) {
@@ -875,6 +932,8 @@ static void virtio_balloon_instance_init(Object *obj)
 
     object_property_add(obj, "guest-stats", "guest statistics",
                         balloon_stats_get_all, NULL, NULL, s, NULL);
+    object_property_add(obj, "guest-page-hinting", "guest page hinting",
+                        NULL, NULL, NULL, s, NULL);
 
     object_property_add(obj, "guest-stats-polling-interval", "int",
                         balloon_stats_get_poll_interval,
